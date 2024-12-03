@@ -85,7 +85,9 @@ prompt_pure_set_title() {
 }
 
 prompt_pure_preexec() {
-	if [[ -n $prompt_pure_git_fetch_pattern ]]; then
+	setopt localoptions noshwordsplit
+
+	if [[ "${prompt_pure_vcs_type}" == "git" && -n $prompt_pure_git_fetch_pattern ]]; then
 		# Detect when Git is performing pull/fetch, including Git aliases.
 		local -H MATCH MBEGIN MEND match mbegin mend
 		if [[ $2 =~ (git|hub)\ (.*\ )?($prompt_pure_git_fetch_pattern)(\ .*)?$ ]]; then
@@ -157,9 +159,9 @@ prompt_pure_preprompt_render() {
 
 	unset prompt_pure_async_render_requested
 
-	# Update git branch color based on cache state.
+	# Update VCS branch color based on cache state.
 	typeset -g prompt_pure_git_branch_color=$prompt_pure_colors[git:branch]
-	[[ -n ${prompt_pure_git_last_dirty_check_timestamp+x} ]] && prompt_pure_git_branch_color=$prompt_pure_colors[git:branch:cached]
+	[[ -n ${prompt_pure_vcs_last_dirty_check_timestamp+x} ]] && prompt_pure_git_branch_color=$prompt_pure_colors[git:branch:cached]
 
 	# Update psvar values. PROMPT uses %(NV.true.false) to conditionally
 	# render each part. See prompt_pure_setup for the PROMPT template.
@@ -170,21 +172,21 @@ prompt_pure_preprompt_render() {
 
 	# psvar[13]: Username flag (set once in prompt_pure_state_setup).
 
-	# psvar[14]: Git branch name.
+	# psvar[14]: VCS branch name.
 	psvar[14]=${prompt_pure_vcs_info[branch]}
 
-	# psvar[15]: Git dirty marker.
-	psvar[15]=${prompt_pure_git_dirty}
+	# psvar[15]: VCS dirty marker.
+	psvar[15]=${prompt_pure_vcs_dirty}
 
-	# psvar[16]: Git action (rebase/merge).
+	# psvar[16]: VCS action (rebase/merge).
 	psvar[16]=${prompt_pure_vcs_info[action]}
 
-	# psvar[17]: Git arrows (push/pull).
-	psvar[17]=${prompt_pure_git_arrows}
+	# psvar[17]: VCS arrows (push/pull).
+	psvar[17]=${prompt_pure_vcs_arrows}
 
-	# psvar[18]: Git stash symbol.
+	# psvar[18]: VCS stash symbol.
 	psvar[18]=
-	[[ -n $prompt_pure_git_stash ]] && psvar[18]=${PURE_GIT_STASH_SYMBOL-≡}
+	[[ -n $prompt_pure_vcs_stash ]] && psvar[18]=${PURE_GIT_STASH_SYMBOL-≡}
 
 	# psvar[19]: Command execution time.
 	psvar[19]=${prompt_pure_cmd_exec_time}
@@ -318,23 +320,30 @@ prompt_pure_async_git_aliases() {
 prompt_pure_async_vcs_info() {
 	setopt localoptions noshwordsplit
 
+	local -a vcs_list
+	# load list of vcs'es from zstyle, but default to git only
+	if ! zstyle -a ':prompt:pure:vcs_info' vcs_list 'vcs_list'; then
+		vcs_list=( git )
+	fi
 	# Configure `vcs_info` inside an async task. This frees up `vcs_info`
 	# to be used or configured as the user pleases.
-	zstyle ':vcs_info:*' enable git
+	zstyle ':vcs_info:*' enable "${vcs_list[@]}"
 	zstyle ':vcs_info:*' use-simple true
 	# Only export four message variables from `vcs_info`.
-	zstyle ':vcs_info:*' max-exports 3
-	# Export branch (%b), Git toplevel (%R), action (rebase/cherry-pick) (%a)
-	zstyle ':vcs_info:git*' formats '%b' '%R' '%a'
-	zstyle ':vcs_info:git*' actionformats '%b' '%R' '%a'
+	zstyle ':vcs_info:*' max-exports 4
+	# Export vcs type (%s), branch (%b), Git toplevel (%R), action (rebase/cherry-pick) (%a)
+	zstyle ':vcs_info:*' formats '%s' '%b' '%R' '%a'
+	zstyle ':vcs_info:*' actionformats '%s' '%b' '%R' '%a'
 
 	vcs_info
 
 	local -A info
 	info[pwd]=$PWD
-	info[branch]=${vcs_info_msg_0_//\%/%%}
-	info[top]=$vcs_info_msg_1_
-	info[action]=$vcs_info_msg_2_
+	# get vcs type without flavor (i.e. git-p4 -> git)
+	info[vcs]=${vcs_info_msg_0_/-*/}
+	info[branch]=${vcs_info_msg_1_//\%/%%}
+	info[top]=$vcs_info_msg_2_
+	info[action]=$vcs_info_msg_3_
 
 	print -r - ${(@kvq)info}
 }
@@ -531,10 +540,11 @@ prompt_pure_async_worker_sync() {
 }
 
 prompt_pure_clear_git_state() {
-	unset prompt_pure_git_dirty prompt_pure_git_last_dirty_check_timestamp prompt_pure_git_arrows prompt_pure_git_stash prompt_pure_git_fetch_pattern
+	unset prompt_pure_vcs_type prompt_pure_vcs_dirty prompt_pure_vcs_last_dirty_check_timestamp prompt_pure_vcs_arrows prompt_pure_vcs_stash prompt_pure_git_fetch_pattern
 	typeset -gA prompt_pure_worker_env=()
 	typeset -gA prompt_pure_worker_env_pending=()
 	typeset -gA prompt_pure_vcs_info
+	prompt_pure_vcs_info[vcs]=
 	prompt_pure_vcs_info[branch]=
 	prompt_pure_vcs_info[top]=
 	prompt_pure_vcs_info[action]=
@@ -617,7 +627,7 @@ prompt_pure_async_tasks() {
 					typeset -gA prompt_pure_worker_env_pending=()
 				fi
 				return
-			}
+		}
 		return
 	fi
 
@@ -628,12 +638,14 @@ prompt_pure_async_tasks() {
 		# Stop any running async jobs.
 		async_flush_jobs "prompt_pure"
 
-		# Reset preprompt variables, switching working tree.
-		unset prompt_pure_git_dirty
-		unset prompt_pure_git_last_dirty_check_timestamp
-		unset prompt_pure_git_arrows
-		unset prompt_pure_git_stash
+		# Reset VCS preprompt variables, switching working tree.
+		unset prompt_pure_vcs_type
+		unset prompt_pure_vcs_dirty
+		unset prompt_pure_vcs_last_dirty_check_timestamp
+		unset prompt_pure_vcs_arrows
+		unset prompt_pure_vcs_stash
 		unset prompt_pure_git_fetch_pattern
+		prompt_pure_vcs_info[vcs]=
 		prompt_pure_vcs_info[branch]=
 		prompt_pure_vcs_info[top]=
 	fi
@@ -650,42 +662,49 @@ prompt_pure_async_tasks() {
 prompt_pure_async_refresh() {
 	setopt localoptions noshwordsplit
 
-	if [[ -z $prompt_pure_git_fetch_pattern ]]; then
+	local vcs_type=${prompt_pure_vcs_type}
+
+	if [[ "${vcs_type}" == "git" && -z $prompt_pure_git_fetch_pattern ]]; then
 		# We set the pattern here to avoid redoing the pattern check until the
 		# working tree has changed. Pull and fetch are always valid patterns.
 		typeset -g prompt_pure_git_fetch_pattern="pull|fetch"
-		async_job "prompt_pure" prompt_pure_async_git_aliases || return
+		async_job "prompt_pure" "prompt_pure_async_git_aliases" || return
 	fi
 
-	async_job "prompt_pure" prompt_pure_async_git_arrows || return
+	async_job "prompt_pure" "prompt_pure_async_${vcs_type}_arrows" || return
 
 	# Do not perform `git fetch` if it is disabled or in home folder.
 	if (( ${PURE_GIT_PULL:-1} )) && [[ $prompt_pure_vcs_info[top] != $HOME ]]; then
 		zstyle -t :prompt:pure:git:fetch only_upstream
 		local only_upstream=$((? == 0))
-		async_job "prompt_pure" prompt_pure_async_git_fetch $only_upstream || return
+		async_job "prompt_pure" "prompt_pure_async_${vcs_type}_fetch" $only_upstream || return
 	fi
 
 	# If dirty checking is sufficiently fast,
 	# tell the worker to check it again, or wait for timeout.
-	integer time_since_last_dirty_check=$(( EPOCHSECONDS - ${prompt_pure_git_last_dirty_check_timestamp:-0} ))
+	integer time_since_last_dirty_check=$(( EPOCHSECONDS - ${prompt_pure_vcs_last_dirty_check_timestamp:-0} ))
 	if (( time_since_last_dirty_check > ${PURE_GIT_DELAY_DIRTY_CHECK:-1800} )); then
-		unset prompt_pure_git_last_dirty_check_timestamp
-		# Check if the working tree is dirty.
-		zstyle -t ":prompt:pure:git:dirty" detailed
-		local detailed_dirty=$((? == 0))
-		async_job "prompt_pure" prompt_pure_async_git_dirty ${PURE_GIT_UNTRACKED_DIRTY:-1} $detailed_dirty || return
+		unset prompt_pure_vcs_last_dirty_check_timestamp
+		if [[ $vcs_type == git ]]; then
+			# Check if the working tree is dirty.
+			zstyle -t ":prompt:pure:git:dirty" detailed
+			local detailed_dirty=$((? == 0))
+			async_job "prompt_pure" "prompt_pure_async_${vcs_type}_dirty" ${PURE_GIT_UNTRACKED_DIRTY:-1} $detailed_dirty || return
+		else
+			# Check if the working tree is dirty.
+			async_job "prompt_pure" "prompt_pure_async_${vcs_type}_dirty" ${PURE_GIT_UNTRACKED_DIRTY:-1} || return
+		fi
 	fi
 
 	# If stash is enabled, tell async worker to count stashes
 	if zstyle -t ":prompt:pure:git:stash" show; then
-		async_job "prompt_pure" prompt_pure_async_git_stash || return
+		async_job "prompt_pure" "prompt_pure_async_${vcs_type}_stash" || return
 	else
-		unset prompt_pure_git_stash
+		unset prompt_pure_vcs_stash
 	fi
 }
 
-prompt_pure_check_git_arrows() {
+prompt_pure_check_vcs_arrows() {
 	setopt localoptions noshwordsplit
 	local arrows left=${1:-0} right=${2:-0}
 
@@ -792,14 +811,18 @@ prompt_pure_async_callback() {
 			fi
 			unset MATCH MBEGIN MEND
 
-			# The update has a Git top-level set, which means we just entered a new
-			# Git directory. Run the async refresh tasks.
-			[[ -n $info[top] ]] && [[ -z $prompt_pure_vcs_info[top] ]] && prompt_pure_async_refresh
+			local entered_vcs_tree=0
+			[[ -n $info[top] ]] && [[ -z $prompt_pure_vcs_info[top] ]] && entered_vcs_tree=1
 
-			# Always update branch, top-level and stash.
+			# Always update vcs, branch, top-level and stash.
+			prompt_pure_vcs_type=$info[vcs]
 			prompt_pure_vcs_info[branch]=$info[branch]
 			prompt_pure_vcs_info[top]=$info[top]
 			prompt_pure_vcs_info[action]=$info[action]
+
+			# The update has a VCS top-level set, which means we just entered a new
+			# VCS directory. Run the async refresh tasks after updating VCS state.
+			(( entered_vcs_tree )) && prompt_pure_async_refresh
 
 			do_render=1
 			;;
@@ -809,58 +832,65 @@ prompt_pure_async_callback() {
 				prompt_pure_git_fetch_pattern+="|$output"
 			fi
 			;;
-		prompt_pure_async_git_dirty)
-			local prev_dirty=$prompt_pure_git_dirty
-			if (( code == 0 )); then
-				unset prompt_pure_git_dirty
+		prompt_pure_async_*_dirty)
+			local prev_dirty=$prompt_pure_vcs_dirty
+			# 127 means _dirty function was not defined for current vcs, assume non-dirty
+			if (( code == 0 || code == 127 )); then
+				unset prompt_pure_vcs_dirty
 			else
-				typeset -g prompt_pure_git_dirty="${output:-*}"
+				typeset -g prompt_pure_vcs_dirty="${output:-*}"
 			fi
 
-			[[ $prev_dirty != $prompt_pure_git_dirty ]] && do_render=1
+			[[ $prev_dirty != $prompt_pure_vcs_dirty ]] && do_render=1
 
-			# When `prompt_pure_git_last_dirty_check_timestamp` is set, the Git info is displayed
+			# When `prompt_pure_vcs_last_dirty_check_timestamp` is set, the VCS info is displayed
 			# in a different color. To distinguish between a "fresh" and a "cached" result, the
 			# preprompt is rendered before setting this variable. Thus, only upon the next
 			# rendering of the preprompt will the result appear in a different color.
-			(( $exec_time > 5 )) && prompt_pure_git_last_dirty_check_timestamp=$EPOCHSECONDS
+			(( $exec_time > 5 )) && prompt_pure_vcs_last_dirty_check_timestamp=$EPOCHSECONDS
 			;;
-		prompt_pure_async_git_fetch|prompt_pure_async_git_arrows)
-			# `prompt_pure_async_git_fetch` executes `prompt_pure_async_git_arrows`
+		prompt_pure_async_*_fetch|prompt_pure_async_*_arrows)
+			# `prompt_pure_async_vcs_fetch` executes `prompt_pure_async_vcs_arrows`
 			# after a successful fetch.
 			case $code in
 				0)
 					local REPLY
-					prompt_pure_check_git_arrows ${(ps:\t:)output}
-					if [[ $prompt_pure_git_arrows != $REPLY ]]; then
-						typeset -g prompt_pure_git_arrows=$REPLY
+					prompt_pure_check_vcs_arrows ${(ps:\t:)output}
+					if [[ $prompt_pure_vcs_arrows != $REPLY ]]; then
+						typeset -g prompt_pure_vcs_arrows=$REPLY
 						do_render=1
 					fi
 					;;
-				97)
-					# No remote available, make sure to clear git arrows if set.
-					if [[ -n $prompt_pure_git_arrows ]]; then
-						typeset -g prompt_pure_git_arrows=
+				97|127)
+					# 97: No remote available
+					# 127: Functions for current VCS have not been defined
+					# make sure to clear vcs arrows if set.
+					if [[ -n $prompt_pure_vcs_arrows ]]; then
+						typeset -g prompt_pure_vcs_arrows=
 						do_render=1
 					fi
 					;;
 				99|98)
-					# Git fetch failed.
+					# VCS fetch failed.
 					;;
 				*)
-					# Non-zero exit status from `prompt_pure_async_git_arrows`,
+					# Non-zero exit status from `prompt_pure_async_vcs_arrows`,
 					# indicating that there is no upstream configured.
-					if [[ -n $prompt_pure_git_arrows ]]; then
-						unset prompt_pure_git_arrows
+					if [[ -n $prompt_pure_vcs_arrows ]]; then
+						unset prompt_pure_vcs_arrows
 						do_render=1
 					fi
 					;;
 			esac
 			;;
-		prompt_pure_async_git_stash)
-			local prev_stash=$prompt_pure_git_stash
-			typeset -g prompt_pure_git_stash=$output
-			[[ $prev_stash != $prompt_pure_git_stash ]] && do_render=1
+		prompt_pure_async_*_stash)
+			local prev_stash=$prompt_pure_vcs_stash
+			if (( code == 0 )); then
+				typeset -g prompt_pure_vcs_stash="$output"
+			else
+				typeset -g prompt_pure_vcs_stash=""
+			fi
+			[[ $prev_stash != $prompt_pure_vcs_stash ]] && do_render=1
 			;;
 	esac
 
